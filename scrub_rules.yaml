@@ -1,0 +1,33 @@
+# api_base -> 需从日志响应体中清洗的 JSON 属性
+# （客户端响应绝不受影响）。
+#
+# 匹配规则：最长前缀优先；比较前双边归一化
+# （转小写、去尾部 '/'）。
+#
+# 路径语法：点路径 + 数组访问
+#   key.subkey        嵌套对象键
+#   key[*]            数组的每个元素
+#   key[0]            指定数组下标
+#
+# 清洗语义（结构完全守恒）：命中路径之下**所有字符串叶子**替换为
+# custom_logger.SCRUB_PLACEHOLDER（默认 "<scrubbed>"）。键名、值的 JSON 类型、
+# 每层数组的元素个数全部与原始保持一致；非字符串叶子（数字 / 布尔 / null）
+# 与空容器原样保留。占位符不携带原长度 / 类型 / hash 等元信息。
+#
+# 键名：主键为 scrub_paths；旧键 remove_paths 仍可用，但启动时会打
+# deprecation 提醒，建议尽快改名。
+#
+# api_base 未命中任何规则的请求原样写入。
+# 命中规则却一个叶子都没替换时会打 warning（提示路径写错或已过期）。
+# 注意：规则在容器启动时加载一次 —— 修改后需重启。
+
+rules:
+  # 端到端测试规则：provider-a 在 choices[*].message.content 返回 base64
+  - api_base_prefix: "https://provider-a.example.com"
+    scrub_paths:
+      - "choices[*].message.content"
+
+  # 示例：图像生成类端点，data[*].b64_json 存放 base64
+  - api_base_prefix: "https://provider-b.example.com/v1"
+    scrub_paths:
+      - "data[*].b64_json"

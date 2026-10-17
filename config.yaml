@@ -1,0 +1,25 @@
+model_list:
+  # 端到端测试模型：api_base 命中 provider-a 清洗规则。
+  # mock_response 模拟 message.content 中的大 base64 载荷。
+  - model_name: hit-model
+    litellm_params:
+      model: openai/fake-model
+      api_key: "fake-key"
+      api_base: "https://provider-a.example.com/v1"
+      mock_response: "data:image/png;base64,QmFzZTY0RmFrZUltYWdlRGF0YUJhc2U2NEZha2VJbWFnZURhdGFCYXNlNjRGYWtlSW1hZ2VEYXRhQmFzZTY0RmFrZUltYWdlRGF0YQ=="
+
+  # 端到端对照模型：api_base 不命中任何规则 -> 原样写入日志。
+  - model_name: miss-model
+    litellm_params:
+      model: openai/fake-model
+      api_key: "fake-key"
+      api_base: "https://provider-x.example.com/v1"
+      mock_response: "hello world, this response must be stored untouched"
+
+litellm_settings:
+  callbacks: ["custom_logger.base64_scrub_logger_instance"]
+
+general_settings:
+  # 鉴权走 LiteLLM 内建的 master key（Bearer sk-1234），不再挂自定义鉴权钩子
+  master_key: os.environ/LITELLM_MASTER_KEY
+  store_prompts_in_spend_logs: true

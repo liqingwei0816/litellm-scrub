@@ -1,0 +1,29 @@
+services:
+  litellm:
+    image: ghcr.io/berriai/litellm:v1.83.14-stable
+    container_name: litellm-scrub
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./custom_logger.py:/app/custom_logger.py:ro
+      - ./scrub_rules.yaml:/app/scrub_rules.yaml:ro
+    environment:
+      - LITELLM_MASTER_KEY=sk-1234
+      # 宿主机映射的 Postgres（5433）上专用的 litellm 数据库
+      - DATABASE_URL=postgresql://litellm:litellm@host.docker.internal:5433/litellm?sslmode=disable
+      - SCRUB_RULES_PATH=/app/scrub_rules.yaml
+      # 清洗行为可调项（默认值即为下方注释掉的写法，需要时才取消注释）：
+      # - SCRUB_PLACEHOLDER=<scrubbed>   # 字符串叶子替换成的占位符
+      # - MAX_SCRUB_DEPTH=64             # 子树遍历限深，超出会记 warning
+      #
+      # 取消注释可放宽 LiteLLM 自身对 SpendLogs 的字符串截断阈值。
+      # 已核实 v1.83.14 源码：该截断对每个超长字符串"保留头 35% + 尾 65%"，
+      # 只改字符串内容、不改 JSON 结构，所以调大它并不会让 JSON 变得更完整，
+      # 真正的代价是 Postgres 里可能出现很大的行、且超长 base64 的头尾会残留
+      # 在库中。默认 2048，通常无需调整：
+      # - MAX_STRING_LENGTH_PROMPT_IN_DB=10000000
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command: ["--config", "/app/config.yaml","--detailed_debug"]
+    restart: unless-stopped
