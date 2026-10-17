@@ -156,7 +156,7 @@ ruff 用 manylinux wheel 解包出的二进制（进容器需 `chmod +x`）；�
 
 单代理串行跑，**不要并发起两个代理容器**（实测会把 Docker Desktop 引擎打到所有 API 返回 500）：
 
-1. 校验 `scrub_rules.yaml` 的 sha256 是仓库原版（当前 `b4ac8a3829f70aa3…b20e77c3`）。
+1. 校验 `scrub_rules.yaml` 的 sha256 是仓库原版（`416012233d5f338e…f30a71c`）。
 2. 发请求 → 记录响应体与 `id`（清洗开 A）。
 3. 把 `api_base_prefix` 改成 `https://provider-a.invalid`（等效关闭清洗）→ 重启 → 发同样请求（关）。
 4. 改回并再次校验 sha256 → 重启 → 发第三次请求（清洗开 B）。
