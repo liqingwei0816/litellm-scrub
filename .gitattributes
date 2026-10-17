@@ -1,0 +1,5 @@
+# 容器里跑的是 Linux，工作树必须保持 LF：custom_logger.py 等文件是 :ro 直接
+# bind-mount 进镜像的，检出时被改成 CRLF 会污染运行时读到的字节。
+* text=auto eol=lf
+*.png binary
+*.ico binary
