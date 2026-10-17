@@ -76,6 +76,32 @@ from litellm.integrations.custom_logger import CustomLogger
 # 后续所有 logger.warning(...) / logger.info(...) 都会带上这个名字，便于排查。
 logger = logging.getLogger("base64_scrub_logger")
 
+
+def _int_env(name: str, default: int) -> int:
+    """
+    读一个整数型环境变量：没设置就用默认值，设置了非法值就告警并退回默认。
+
+    【为什么不让它抛异常】本模块其它地方一律 fail-open（清洗出错就原样入库，
+    绝不阻断请求）。但这两个常量在 import 期就要用，int() 抛出来的异常会让
+    整个回调加载失败，LiteLLM 连日志都写不了——compose 里一个拼写错误不该
+    有这么大的后果，所以这里也 fail-open。
+    """
+    raw = os.environ.get(name)
+    if raw is None:                       # 没设置：用默认值，不算异常
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):       # 写了 "64x" 这种非法值
+        logger.warning("%s=%r is not an integer; falling back to %d",
+                       name, raw, default)
+        return default
+    if value < 0:                         # 负数没有意义（0 有意义：不进任何子树）
+        logger.warning("%s=%d must not be negative; falling back to %d",
+                       name, value, default)
+        return default
+    return value
+
+
 # 规则文件路径：优先读环境变量 SCRUB_RULES_PATH，没设置就用默认值。
 # os.environ.get(键, 默认值) 的意思是：环境变量里有就用它，没有就用默认值。
 RULES_PATH = os.environ.get("SCRUB_RULES_PATH", "/app/scrub_rules.yaml")
@@ -91,10 +117,10 @@ SCRUB_PLACEHOLDER = os.environ.get("SCRUB_PLACEHOLDER", "<scrubbed>")
 # 变成一个可观测事件而不是静默漏清洗。真实 LLM 响应通常在 3-4 层
 # （上游同机制取 20，见 logging_utils.py:48 _MAX_TRUNCATION_DEPTH），
 # 这里留足余量。
-MAX_SCRUB_DEPTH = int(os.environ.get("MAX_SCRUB_DEPTH", "64"))
+MAX_SCRUB_DEPTH = _int_env("MAX_SCRUB_DEPTH", 64)
 
 # 单条路径允许的记号数量上限，用于在启动时就挡掉畸形超长路径。
-MAX_PATH_TOKENS = int(os.environ.get("MAX_PATH_TOKENS", "64"))
+MAX_PATH_TOKENS = _int_env("MAX_PATH_TOKENS", 64)
 
 # --------------------------------------------------------------------
 # 路径 token（记号）的三种类型常量
@@ -113,6 +139,17 @@ _KEY, _IDX, _WILD = "key", "idx", "wild"
 #           例如 [*][0] 会依次抠出 "*" 和 "0"。
 _PART_RE = re.compile(r"^([^\[\]]*)((?:\[[^\[\]]+\])*)$")
 _IDX_RE = re.compile(r"\[([^\[\]]+)\]")
+
+
+def _as_dict(value):
+    """
+    是 dict 就原样返回，否则返回空 dict。
+
+    kwargs 是 LiteLLM 交进来的外部数据，某个键可能是 None、字符串甚至列表。
+    统一过这一层，后面就能放心地连续 .get()，不会因为对非字典取值而抛异常
+    ——抛异常的后果是"这次清洗整个跳过"，比多写一个函数贵得多。
+    """
+    return value if isinstance(value, dict) else {}
 
 
 def _normalize_base(base: str) -> str:
@@ -194,12 +231,15 @@ def _scrub_subtree(container):
     stack = [(container, 0)]
     while stack:
         node, depth = stack.pop()
-        # dict 用它的键值对，list 用 (下标, 元素)；统一成同一种写法处理
-        items = node.items() if isinstance(node, dict) else list(enumerate(node))
+        # dict 用它的键值对，list 用 (下标, 元素)；统一成同一种写法处理。
+        # 两边都取惰性视图，不先物化成列表：下面只改"已有键/已有下标"上的值，
+        # 不增删元素，所以边遍历边改是安全的；而这个函数在最热的路径上，
+        # 为一个 1 万元素的数组先造一份等长的 (下标, 值) 副本是白花的分配。
+        items = node.items() if isinstance(node, dict) else enumerate(node)
         for key, value in items:
             if isinstance(value, str):
                 # 只改这个键/下标上的值，不增不减键、不增不减元素，
-                # 所以遍历过程中修改 node 是安全的（字典大小没变）。
+                # 所以遍历过程中修改 node 是安全的（容器大小没变）。
                 if value != SCRUB_PLACEHOLDER:
                     node[key] = SCRUB_PLACEHOLDER
                     replaced += 1
@@ -354,6 +394,20 @@ def _load_rules(path: str):
             if token_lists:                          # 这条规则至少有一个有效路径才收录
                 # 前缀先归一化，再和它的记号列表们一起存起来
                 compiled.append((_normalize_base(str(prefix)), token_lists))
+        # 同一个前缀写了两条规则：_match_rule 是"最长前缀优先 + 命中即返回"，
+        # 而排序对等长前缀保持文件顺序，所以只有先出现的那条会生效，另一条的
+        # 路径永远不被执行 —— 它要清洗的字段会整段原样入库。这属于静默失效，
+        # 和"路径写错"同级，用 error。
+        seen_prefixes = set()
+        for prefix, _ in compiled:
+            if prefix in seen_prefixes:
+                logger.error(
+                    "duplicate api_base_prefix %r: only the first such rule takes "
+                    "effect and the other's scrub_paths are never applied; "
+                    "merge them into one rule", prefix,
+                )
+            else:
+                seen_prefixes.add(prefix)
         # 按前缀长度降序排序：len(r[0]) 取前缀长度，reverse=True 表示从大到小
         compiled.sort(key=lambda r: len(r[0]), reverse=True)
         # 打印一条 info 日志，说明加载了几条规则、分别是哪些前缀（便于确认生效）
@@ -413,25 +467,29 @@ def _extract_api_base(kwargs) -> str:
     参数 kwargs：一个字典，装着这次调用的各种上下文信息。
     返回值：找到的 api_base 字符串；都找不到就返回空字符串 ""。
     """
-    # .get(键) or {} 的写法：取出这个键，如果它是 None 就用空字典 {} 代替，
-    # 这样后面再 .get 就不会因为对 None 取值而报错。
-    slo = kwargs.get("standard_logging_object") or {}      # 标准日志对象
-    litellm_params = kwargs.get("litellm_params") or {}    # LiteLLM 内部参数
-    metadata = litellm_params.get("metadata") or {}        # 路由器写入的元数据
+    # 每一层都过 _as_dict：某一层不是字典（None / 字符串 / 列表）就退化成空字典。
+    # 这样"这一层没有 api_base"和"这一层形状不对"统一成同一种结果，不会抛异常；
+    # 抛异常的后果是整次清洗被最外层兜底跳过、数据原样入库，代价大得多。
+    slo = _as_dict(kwargs.get("standard_logging_object"))    # 标准日志对象
+    litellm_params = _as_dict(kwargs.get("litellm_params"))  # LiteLLM 内部参数
+    metadata = _as_dict(litellm_params.get("metadata"))      # 路由器写入的元数据
+    model_parameters = _as_dict(slo.get("model_parameters"))
+    slo_metadata = _as_dict(slo.get("metadata"))
+    optional_params = _as_dict(kwargs.get("optional_params"))
     # 按优先级排列的候选位置，逐个尝试：
     for candidate in (
-        # 1) 最可靠：路由器写入的 metadata.api_base（先确认 metadata 是字典再取）
-        metadata.get("api_base") if isinstance(metadata, dict) else None,
+        # 1) 最可靠：路由器写入的 metadata.api_base
+        metadata.get("api_base"),
         # 2) litellm_params 顶层的 api_base
         litellm_params.get("api_base"),
         # 3) 标准日志对象顶层的 api_base
         slo.get("api_base"),
         # 4) 标准日志对象里 model_parameters 下的 api_base
-        (slo.get("model_parameters") or {}).get("api_base"),
+        model_parameters.get("api_base"),
         # 5) 标准日志对象里 metadata 下的 api_base
-        ((slo.get("metadata") or {}) or {}).get("api_base"),
+        slo_metadata.get("api_base"),
         # 6) 兜底：optional_params 里的 api_base
-        (kwargs.get("optional_params") or {}).get("api_base"),
+        optional_params.get("api_base"),
     ):
         if candidate:                # 只要这个候选值"非空"（不是 None/空串）
             return str(candidate)    # 就把它转成字符串返回
@@ -443,20 +501,97 @@ def _scrub_slo_response(slo, token_lists):
     对 standard_logging_object["response"] 按规则逐条清洗。
     返回 (替换掉的叶子数, 被截停的容器数, 净节省的字符数)。
 
-    async_logging_hook 和 _sync_scrub 都调用这里，保证"主路径"和"兜底路径"
-    的清洗语义、统计口径完全一致——否则一旦走了兜底，日志里的数字就不可比了。
+    async 与 sync 两条路径都调用这里，保证清洗语义与统计口径完全一致。
+
+    【形状不符时为什么要单独告警】
+    经核实 v1.83.14：SpendLogs.response 取自 standard_logging_object["response"]
+    （spend_tracking_utils.py:465 调 _get_response_for_spend_logs_payload，
+    :852 是 payload.get("response")），而 StandardLoggingPayload 是 TypedDict，
+    运行时就是个 dict。哪天上游把它换成 pydantic 模型，下面这两个 isinstance
+    判定会整体失效——一个字段都不换。那时若只报"命中规则却零替换，请检查路径"，
+    会把排查引向错误方向，所以这里把"形状不符"单独讲清楚。
+    slo 整个缺失（None）不告警：上游此时直接写 "{}"（:848-850），没有敏感数据。
     """
-    # 双重确认：slo 是字典，且它的 response 也是字典，才动手
-    if not (isinstance(slo, dict) and isinstance(slo.get("response"), dict)):
+    if not isinstance(slo, dict):
+        if slo is not None:
+            logger.warning(
+                "standard_logging_object is %s, not a dict; response will be "
+                "stored as-is (scrubbing needs a dict here)", type(slo).__name__,
+            )
+        return 0, 0, 0
+    response = slo.get("response")
+    if not isinstance(response, dict):
+        if response is not None:
+            logger.warning(
+                "standard_logging_object['response'] is %s, not a dict; "
+                "stored as-is", type(response).__name__,
+            )
         return 0, 0, 0
     replaced = capped = saved = 0
     for _raw_path, tokens in token_lists:            # 遍历这条规则的每个路径
         # 直接传 tokens 即可：_scrub_path 只"读取"记号（tokens[0]、rest 切片），
         # 从不修改它，因此无需复制，省去每请求的开销。
-        n, c, s = _scrub_path(slo["response"], tokens)
+        n, c, s = _scrub_path(response, tokens)
         replaced += n
         capped += c
         saved += s
+    return replaced, capped, saved
+
+
+def _scrub_and_report(kwargs, origin: str):
+    """
+    "清洗 + 留痕"的唯一实现，两个钩子都调它。
+
+    【为什么必须只有一份】
+    以前 async 与 sync 各写了一份日志逻辑，结果 sync 那份漏了"超出限深"的
+    WARNING：同一个超深载荷，走主路径会告警、走兜底路径就静默。而"清洗没有
+    覆盖全"恰恰是本项目最不能静默的事件。合并之后，两条路径的清洗语义、
+    统计口径、告警内容完全一致，只有日志里的 hook= 字段能区分是谁触发的。
+
+    origin：调用方标识（"async" / "sync"），只进日志。
+    返回：命中规则时返回 (replaced, capped, saved)；没命中返回 None。
+    """
+    # 第一步：找出这次请求的 api_base；第二步：用它匹配规则
+    api_base = _extract_api_base(kwargs)
+    matched = _match_rule(api_base)
+    if not matched:
+        # 没命中任何规则：一个字节都不改，原样入库
+        return None
+    prefix, token_lists = matched
+
+    # 清洗主战场：standard_logging_object["response"]。
+    # LiteLLM 写 SpendLogs 时响应体正是取自这里（spend_tracking_utils.py:465
+    # 调 _get_response_for_spend_logs_payload，:852 是 payload.get("response")），
+    # 所以必须就地改它，数据库里存的才会是清洗后的内容。
+    replaced, capped, saved = _scrub_slo_response(
+        kwargs.get("standard_logging_object"), token_lists
+    )
+    call_id = kwargs.get("litellm_call_id")
+
+    # 命中了规则却一个叶子都没换：几乎一定是规则路径写错或已经过期
+    # （响应结构变了）。在替换语义下这意味着敏感数据被整段入库，
+    # 所以这里显式提醒，而不是让它静默通过。
+    if replaced == 0:
+        logger.warning(
+            "scrub rule matched but replaced nothing "
+            "(rule prefix=%s, paths=%s, call_id=%s, hook=%s); "
+            "check that these paths still exist in the response",
+            prefix, [p for p, _ in token_lists], call_id, origin,
+        )
+    # 逐请求的统计是 INFO：默认部署下看不到（proxy 没把 root logger 调到 INFO），
+    # 排查或做容量评估时再放开级别。必须被看见的信号一律走 WARNING。
+    logger.info(
+        "scrubbed response for api_base=%s (rule prefix=%s, call_id=%s, hook=%s): "
+        "%d string leaf/leaves replaced, ~%d chars saved, "
+        "%d container(s) depth-capped",
+        api_base, prefix, call_id, origin, replaced, saved, capped,
+    )
+    if capped:
+        logger.warning(
+            "scrub stopped at %d container(s) beyond MAX_SCRUB_DEPTH=%d; "
+            "their string leaves were NOT replaced (prefix=%s, call_id=%s)",
+            capped, MAX_SCRUB_DEPTH, prefix, call_id,
+        )
     return replaced, capped, saved
 
 
@@ -464,159 +599,62 @@ class Base64ScrubLogger(CustomLogger):
     """
     自定义日志器主类。继承自 LiteLLM 的 CustomLogger。
 
-    LiteLLM 在"一次请求成功、准备写日志"时，会调用我们重写的
-    async_logging_hook 方法，把"上下文 kwargs"和"响应结果 result"交给我们，
-    让我们有机会在写库前修改它们。我们就是在这里执行清洗。
+    LiteLLM 有两条日志钩子路径，两条都必须实现，漏掉任何一条就等于在那条
+    路径上完全不清洗（经核实 v1.83.14 源码，两处都会调用并用返回值替换上下文）：
+      * async_logging_hook —— 异步路径（proxy 常态），
+        litellm_logging.py:2670 / :2679 处 await；
+      * logging_hook —— 同步路径，litellm_logging.py:2104 / :2110 处调用。
+    两个钩子都必须返回 (kwargs, result) 二元组：上游是直接解包赋值的，
+    返回 None 会让它抛 TypeError。
     """
 
     async def async_logging_hook(self, kwargs, result, call_type):
         """
-        异步日志钩子（主入口）。async 表示这是一个"异步函数"，
-        LiteLLM 会在它的异步流程里等待(await)它执行完。
+        异步日志钩子（主入口）。
 
         参数：
             kwargs    ：这次调用的上下文字典（含 standard_logging_object 等）
             result    ：这次调用得到的响应结果对象
             call_type ：调用类型（如 acompletion 表示异步补全）
         返回：
-            (kwargs, result) 这个二元组。LiteLLM 会拿我们返回的这两样继续往下走。
+            (kwargs, result)。kwargs 里的 standard_logging_object 已被原地清洗。
         """
         try:
-            # 第一步：找出这次请求的 api_base
-            api_base = _extract_api_base(kwargs)
-            # 第二步：用 api_base 去匹配规则
-            matched = _match_rule(api_base)
-            if not matched:
-                # 没命中任何规则：什么都不改，原样把 kwargs、result 透传回去
-                return kwargs, result
-            # 命中了：解包出"命中的前缀"和"这条规则要清洗的记号列表们"
-            prefix, token_lists = matched
-
-            # ---- 清洗点 1：standard_logging_object ----
-            # 这是关键！LiteLLM 写 SpendLogs 表时，响应体实际取自
-            # standard_logging_object["response"]。所以必须在这里原地改，
-            # 数据库里存的才会是清洗后的内容。
-            # 清洗主战场：standard_logging_object["response"]
-            replaced, capped, saved = _scrub_slo_response(
-                kwargs.get("standard_logging_object"), token_lists
-            )
-
-            # ---- 关于 result：刻意"原样透传"，不做任何修改 ----
-            # 经核实 LiteLLM v1.83.x 源码：
-            #   1) SpendLogs 表的 response 字段取自
-            #      standard_logging_object["response"]，
-            #      已在上面"清洗点 1"原地处理完毕，数据库里已是清洗后的内容；
-            #   2) slo["response"] 是 LiteLLM 内部生成的独立 dict，与返回给客户端的
-            #      响应对象没有共享引用；
-            #   3) 本钩子在响应"已经返回给客户端之后"才被调用。
-            # 因此完全不需要、也不应该替换 result。若把 result 换成 model_dump() 得到的
-            # 裸 dict，会使下游回调（如 _ProxyDBLogger 的工具登记）用属性访问
-            # hasattr(result, "choices") 判断失败，导致 tool_calls 静默丢失。
-            # 所以这里直接返回原始 result，保持其对象类型不变。
-
-            # 命中了规则却一个叶子都没换：几乎一定是规则路径写错或已经过期
-            # （响应结构变了）。在替换语义下这意味着敏感数据被整段入库，
-            # 所以这里显式提醒，而不是让它静默通过。
-            if replaced == 0:
-                logger.warning(
-                    "scrub rule matched but replaced nothing "
-                    "(rule prefix=%s, paths=%s, call_id=%s); "
-                    "check that these paths still exist in the response",
-                    prefix, [p for p, _ in token_lists],
-                    kwargs.get("litellm_call_id"),
-                )
-            # 记录一条 info 日志，说明这次确实清洗了多少（便于排查与容量评估）
-            logger.info(
-                "scrubbed response for api_base=%s (rule prefix=%s, call_id=%s): "
-                "%d string leaf/leaves replaced, ~%d chars saved, "
-                "%d container(s) depth-capped",
-                api_base, prefix, kwargs.get("litellm_call_id"),
-                replaced, saved, capped,
-            )
-            if capped:
-                logger.warning(
-                    "scrub stopped at %d container(s) beyond MAX_SCRUB_DEPTH=%d; "
-                    "their string leaves were NOT replaced (prefix=%s)",
-                    capped, MAX_SCRUB_DEPTH, prefix,
-                )
-            # 返回：kwargs（其中的 standard_logging_object 已被原地改过）+ 原始 result
-            return kwargs, result
+            _scrub_and_report(kwargs, "async")
         except Exception:
             # 最外层兜底：无论上面哪里出了意外，都绝不让日志管道崩溃。
             # 记录 warning（带完整堆栈 exc_info=True），然后原样返回，让日志照常写入。
             logger.warning("async_logging_hook failed; writing as-is", exc_info=True)
-            return kwargs, result
+
+        # ---- 关于 result：刻意"原样透传"，不做任何修改 ----
+        # 经核实 LiteLLM v1.83.14 源码：
+        #   1) SpendLogs 表的 response 字段取自 standard_logging_object["response"]，
+        #      已在 _scrub_and_report 里原地处理完毕，数据库里已是清洗后的内容；
+        #   2) slo["response"] 是 LiteLLM 内部生成的独立 dict，与返回给客户端的
+        #      响应对象没有共享引用；
+        #   3) 本钩子在响应"已经返回给客户端之后"才被调用。
+        # 因此完全不需要、也不应该替换 result。若把 result 换成 model_dump() 得到的
+        # 裸 dict，会使下游回调（如 _ProxyDBLogger 的工具登记）用属性访问
+        # hasattr(result, "choices") 判断失败，导致 tool_calls 静默丢失。
+        return kwargs, result
 
     def logging_hook(self, kwargs, result, call_type):
         """
-        同步版日志钩子（兜底用）。
+        同步日志钩子。
 
-        绝大多数情况下 LiteLLM 走的是上面的 async 版本。但极少数调用点
-        可能用同步方式触发日志，这时会调用这个同步方法。我们在这里想办法
-        复用异步逻辑，实在不行就退化成"只清洗 standard_logging_object"。
-        """
-        import asyncio    # 异步运行时库，用来判断/驱动事件循环
-
-        try:
-            loop = asyncio.get_event_loop()   # 拿到当前的"事件循环"
-            if loop.is_running():
-                # 事件循环正在运行：这里不能再用 run_until_complete（会报错），
-                # 改走纯同步的等价清洗 _sync_scrub。
-                return self._sync_scrub(kwargs, result)
-            # 事件循环没在运行：可以安全地"跑一遍"异步钩子并等它完成
-            return loop.run_until_complete(
-                self.async_logging_hook(kwargs, result, call_type)
-            )
-        except Exception:
-            # 拿不到/无法驱动事件循环（如 Python≥3.12 无 running loop、
-            # 子线程未建 loop）。
-            # 不能就此静默放弃清洗：记录 warning 后退回纯同步清洗 _sync_scrub 兜底，
-            # 至少保证 standard_logging_object 被处理；连兜底都失败才原样返回。
-            logger.warning(
-                "logging_hook asyncio fallback failed; trying sync scrub",
-                exc_info=True,
-            )
-            try:
-                return self._sync_scrub(kwargs, result)
-            except Exception:
-                return kwargs, result
-
-    def _sync_scrub(self, kwargs, result):
-        """
-        纯同步的清洗（_sync 版本）。
-
-        它只做"最核心、最必要"的一件事：就地清洗 standard_logging_object
-        里的目标字段（因为这才是真正决定数据库存什么的地方）。
-        不去碰 result 副本，避免在同步上下文里做复杂操作。
-        清洗实现与主路径共用 _scrub_slo_response，保证语义一致。
+        这里刻意不碰 asyncio：清洗全程没有任何 await，把协程丢进事件循环跑一遍
+        只是白付一次调度开销，还要额外处理"循环正在跑就不能 run_until_complete"
+        "线程里取不到当前循环"这些边界；而 asyncio.get_event_loop() 自 3.12 起
+        已弃用、3.14 起在没有当前循环时直接抛 RuntimeError。直接同步调用共用
+        实现，两条路径的行为因此天然一致。
         """
         try:
-            matched = _match_rule(_extract_api_base(kwargs))  # 找 api_base 并匹配规则
-            if not matched:                  # 没命中：原样返回
-                return kwargs, result
-            prefix, token_lists = matched
-            replaced, capped, saved = _scrub_slo_response(
-                kwargs.get("standard_logging_object"), token_lists
-            )
-            if replaced == 0:
-                logger.warning(
-                    "sync scrub matched but replaced nothing "
-                    "(rule prefix=%s, paths=%s); check response shape",
-                    prefix, [p for p, _ in token_lists],
-                )
-            else:
-                logger.info(
-                    "sync scrubbed response (rule prefix=%s): "
-                    "%d string leaf/leaves replaced, ~%d chars saved, "
-                    "%d container(s) depth-capped",
-                    prefix, replaced, saved, capped,
-                )
-            return kwargs, result
+            _scrub_and_report(kwargs, "sync")
         except Exception:
-            # 出错不影响主流程，但必须留下痕迹：兜底路径一旦失效，
-            # 整行日志就会带着敏感数据原样入库，静默等于漏清洗。
-            logger.warning("sync scrub failed; writing as-is", exc_info=True)
-            return kwargs, result
+            # 兜底路径一旦失效，整行日志就会带着敏感数据原样入库，
+            # 静默等于漏清洗，所以必须留下痕迹。
+            logger.warning("logging_hook failed; writing as-is", exc_info=True)
+        return kwargs, result
 
 
 # 创建一个全局唯一的实例。LiteLLM 通过配置文件里写的

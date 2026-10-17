@@ -689,6 +689,41 @@ def test_repo_rules_file_loads_with_scrub_paths():
     assert all(toks for _, toks in compiled)
 
 
+def test_loader_reports_duplicate_prefix(tmp_path, caplog):
+    """
+    同一前缀写了两条规则 = 第二条的 scrub_paths 永远不生效（_match_rule 命中即返回）。
+
+    这属于静默漏清洗，和"路径写错"同级，必须在启动日志里报 ERROR。
+    """
+    p = write_rules(tmp_path, """
+rules:
+  - api_base_prefix: "https://dup.example.com"
+    scrub_paths: ["choices[*].message.content"]
+  - api_base_prefix: "HTTPS://dup.example.com/"
+    scrub_paths: ["data[*].b64_json"]
+""")
+    with caplog.at_level("INFO"):
+        compiled = cl._load_rules(p)
+    errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+    assert any("duplicate api_base_prefix" in m for m in errors)
+    # 两条都还在列表里（归一化后前缀相同），只是第二条永不命中
+    assert len(compiled) == 2
+    assert compiled[0][0] == compiled[1][0] == "https://dup.example.com"
+
+
+def test_first_of_duplicate_prefixes_wins(monkeypatch):
+    """重复前缀的实际后果：只有先出现的那条规则被应用。"""
+    rules = [
+        ("https://dup.example.com", [("a", cl._tokenize("a"))]),
+        ("https://dup.example.com", [("b", cl._tokenize("b"))]),
+    ]
+    rules.sort(key=lambda r: len(r[0]), reverse=True)
+    monkeypatch.setattr(cl, "_RULES", rules)
+    prefix, token_lists = cl._match_rule("https://dup.example.com/v1")
+    assert prefix == "https://dup.example.com"
+    assert [p for p, _ in token_lists] == ["a"]
+
+
 # --------------------------------------------------------------------
 # 8. api_base 匹配与提取（含既有安全边界）
 # --------------------------------------------------------------------
@@ -731,6 +766,41 @@ def test_extract_api_base_priority_order():
     assert cl._extract_api_base({}) == ""
     # metadata 不是 dict 时不得抛错
     assert cl._extract_api_base({"litellm_params": {"metadata": "oops"}}) == ""
+
+
+@pytest.mark.parametrize("bad", [None, "oops", 42, [], object()])
+def test_extract_api_base_tolerates_non_dict_layers(bad):
+    """
+    kwargs 的每一层都可能不是 dict：任何一层都不得让提取抛异常。
+
+    抛异常的代价是"整次清洗被最外层兜底跳过、敏感数据原样入库"，比"这次找不到
+    api_base"严重得多，所以每一层都过 _as_dict 退化成空字典。
+    """
+    assert cl._extract_api_base({
+        "litellm_params": bad,
+        "standard_logging_object": bad,
+        "optional_params": bad,
+    }) == ""
+    assert cl._extract_api_base({
+        "litellm_params": {"metadata": bad, "api_base": "https://top.example.com"},
+        "standard_logging_object": {"metadata": bad, "model_parameters": bad},
+    }) == "https://top.example.com"
+
+
+def test_extract_api_base_falls_through_empty_strings():
+    """高优先级的键存在但值为空串：必须继续往下找，而不是返回空。"""
+    kb = {
+        "litellm_params": {"metadata": {"api_base": ""}, "api_base": None},
+        "standard_logging_object": {"api_base": "https://slo.example.com"},
+    }
+    assert cl._extract_api_base(kb) == "https://slo.example.com"
+    kb = {
+        "litellm_params": {"metadata": {"api_base": None}, "api_base": ""},
+        "standard_logging_object": {"metadata": {"api_base": "https://slo-meta.example.com"}},
+    }
+    assert cl._extract_api_base(kb) == "https://slo-meta.example.com"
+    kb = {"optional_params": {"api_base": "https://opt.example.com"}}
+    assert cl._extract_api_base(kb) == "https://opt.example.com"
 
 
 # --------------------------------------------------------------------
@@ -799,15 +869,61 @@ def test_async_hook_swallows_exceptions_and_keeps_pipeline(patched_rules, caplog
             None, "x"))
 
 
-def test_sync_scrub_path_matches_async_semantics(patched_rules, chat_response):
+def test_logging_hook_scrubs_like_async_path(patched_rules, chat_response):
     kwargs = make_kwargs("https://provider-a.example.com/v1", chat_response)
-    cl.Base64ScrubLogger()._sync_scrub(kwargs, None)
+    out_kwargs, out_result = cl.Base64ScrubLogger().logging_hook(kwargs, "R", "x")
+    assert out_kwargs is kwargs and out_result == "R"
     assert kwargs["standard_logging_object"]["response"]["choices"][0][
         "message"]["content"] == PH
 
 
+def test_both_hook_paths_emit_identical_logs(patched_rules, caplog):
+    """
+    C13 的硬口径：两条路径的清洗结果与日志必须逐条一致。
+
+    曾经 sync 那份日志逻辑漏了"超出限深"的 WARNING —— 同一个超深载荷走主路径
+    会告警、走兜底路径就静默。这里用同一个载荷分别喂两个钩子，断言除 hook= 标签
+    外日志完全相同。
+    """
+    def build():
+        deep = {"leaf": "SECRET"}
+        cur = deep
+        for _ in range(cl.MAX_SCRUB_DEPTH + 3):
+            cur["next"] = {"leaf": "SECRET"}
+            cur = cur["next"]
+        return {"choices": [{"message": {"content": deep}}]}
+
+    kwargs_async = make_kwargs("https://provider-a.example.com/v1", build())
+    kwargs_sync = make_kwargs("https://provider-a.example.com/v1", build())
+
+    with caplog.at_level("INFO"):
+        asyncio.run(cl.Base64ScrubLogger().async_logging_hook(kwargs_async, None, "x"))
+    async_msgs = [r.getMessage() for r in caplog.records]
+    caplog.clear()
+    with caplog.at_level("INFO"):
+        cl.Base64ScrubLogger().logging_hook(kwargs_sync, None, "x")
+    sync_msgs = [r.getMessage() for r in caplog.records]
+
+    # 清洗结果逐字节一致
+    assert (kwargs_async["standard_logging_object"]["response"]
+            == kwargs_sync["standard_logging_object"]["response"])
+    # 日志一致（只允许 hook= 标签不同）
+    def normalize(msgs):
+        return sorted(m.replace("hook=async", "hook=X").replace("hook=sync", "hook=X")
+                      for m in msgs)
+    assert normalize(async_msgs) == normalize(sync_msgs)
+    # 兜底路径同样必须报"清洗没覆盖全"
+    assert any("MAX_SCRUB_DEPTH" in m for m in sync_msgs)
+
+
 def test_logging_hook_from_running_loop(patched_rules, chat_response):
-    """事件循环正在跑：必须走 _sync_scrub 而不是 run_until_complete 崩掉。"""
+    """
+    从正在运行的事件循环里调用同步钩子：照样清洗，且不得去驱动循环。
+
+    LiteLLM 的同步调用点（litellm_logging.py:2104）可能在异步上下文里触发，
+    此时任何 run_until_complete 都会抛 RuntimeError。清洗全程没有 await，
+    所以这里天然安全 —— 这条测试守着它继续安全。
+    """
     kwargs = make_kwargs("https://provider-a.example.com/v1", chat_response)
     logger_obj = cl.Base64ScrubLogger()
 
@@ -815,13 +931,6 @@ def test_logging_hook_from_running_loop(patched_rules, chat_response):
         return logger_obj.logging_hook(kwargs, None, "completion")
 
     asyncio.run(inside_loop())
-    assert kwargs["standard_logging_object"]["response"]["choices"][0][
-        "message"]["content"] == PH
-
-
-def test_logging_hook_without_running_loop(patched_rules, chat_response):
-    kwargs = make_kwargs("https://provider-a.example.com/v1", chat_response)
-    cl.Base64ScrubLogger().logging_hook(kwargs, None, "completion")
     assert kwargs["standard_logging_object"]["response"]["choices"][0][
         "message"]["content"] == PH
 
@@ -917,74 +1026,129 @@ def test_async_hook_never_raises_on_malformed_kwargs(patched_rules, caplog):
     assert any("async_logging_hook failed" in r.message for r in caplog.records)
 
 
-def test_logging_hook_with_idle_event_loop(patched_rules, chat_response):
-    """事件循环存在但未运行：走 run_until_complete 那条分支。"""
-    loop = asyncio.new_event_loop()
-    try:
-        asyncio.set_event_loop(loop)
-        kwargs = make_kwargs("https://provider-a.example.com/v1", chat_response)
-        cl.Base64ScrubLogger().logging_hook(kwargs, None, "completion")
-        assert kwargs["standard_logging_object"]["response"]["choices"][0][
-            "message"]["content"] == PH
-    finally:
-        asyncio.set_event_loop(None)
-        loop.close()
+def test_logging_hook_never_touches_asyncio(patched_rules, chat_response, monkeypatch):
+    """
+    同步钩子不得依赖 asyncio：取循环的几个 API 全部炸掉也必须照常清洗。
 
-
-def test_sync_scrub_misses_and_warns(patched_rules, caplog, monkeypatch):
-    # 未命中：静默原样返回，不发 warning
-    miss = make_kwargs("https://provider-x.example.com/v1", {"choices": []})
-    with caplog.at_level("INFO"):
-        out_kwargs, out_result = cl.Base64ScrubLogger()._sync_scrub(miss, "R")
-    assert out_kwargs is miss and out_result == "R"
-    assert not any("matched but replaced nothing" in r.message for r in caplog.records)
-
-    # 命中但路径对不上：必须发 warning（漏清洗不可静默）
-    empty = make_kwargs("https://provider-a.example.com/v1", {"choices": []})
-    with caplog.at_level("INFO"):
-        cl.Base64ScrubLogger()._sync_scrub(empty, "R")
-    assert any("sync scrub matched but replaced nothing" in r.message
-               for r in caplog.records)
-
-
-def test_sync_scrub_exception_is_caught_and_logged(patched_rules, caplog, monkeypatch):
+    这条守着"不再用已弃用的 asyncio.get_event_loop()"这个决定 —— 它在 3.12 起
+    弃用、3.14 起没有当前循环时直接抛，而清洗本身全程没有 await。
+    """
     def boom(*a, **kw):
-        raise RuntimeError("synthetic scrub failure")
-
-    monkeypatch.setattr(cl, "_scrub_slo_response", boom)
-    kwargs = make_kwargs("https://provider-a.example.com/v1", {"choices": []})
-    with caplog.at_level("INFO"):
-        out_kwargs, out_result = cl.Base64ScrubLogger()._sync_scrub(kwargs, "R")
-    assert out_kwargs is kwargs and out_result == "R"
-    assert any("sync scrub failed" in r.message for r in caplog.records)
-
-
-def test_logging_hook_falls_back_when_loop_lookup_fails(patched_rules, chat_response,
-                                                        caplog, monkeypatch):
-    """asyncio 取不到事件循环（≥3.12 无线程 loop 的真实情形）：退回 _sync_scrub。"""
-    def no_loop():
         raise RuntimeError("no current event loop")
 
-    monkeypatch.setattr(asyncio, "get_event_loop", no_loop)
+    monkeypatch.setattr(asyncio, "get_event_loop", boom)
+    monkeypatch.setattr(asyncio, "get_running_loop", boom)
+    monkeypatch.setattr(asyncio, "new_event_loop", boom)
     kwargs = make_kwargs("https://provider-a.example.com/v1", chat_response)
-    with caplog.at_level("INFO"):
-        cl.Base64ScrubLogger().logging_hook(kwargs, None, "completion")
-    assert any("asyncio fallback failed" in r.message for r in caplog.records)
+    out_kwargs, out_result = cl.Base64ScrubLogger().logging_hook(kwargs, "R", "completion")
+    assert out_kwargs is kwargs and out_result == "R"
     assert kwargs["standard_logging_object"]["response"]["choices"][0][
         "message"]["content"] == PH
 
 
-def test_logging_hook_final_except_returns_unchanged(patched_rules, monkeypatch):
-    """连兜底 _sync_scrub 都抛异常时：必须原样返回，绝不把异常抛给 LiteLLM。"""
-    def no_loop():
-        raise RuntimeError("no current event loop")
+def test_logging_hook_miss_is_silent_and_mismatch_warns(patched_rules, caplog):
+    # 未命中：静默原样返回，一条日志都不该有
+    miss = make_kwargs("https://provider-x.example.com/v1", {"choices": []})
+    with caplog.at_level("INFO"):
+        out_kwargs, out_result = cl.Base64ScrubLogger().logging_hook(miss, "R", "x")
+    assert out_kwargs is miss and out_result == "R"
+    assert not caplog.records
 
-    monkeypatch.setattr(asyncio, "get_event_loop", no_loop)
-    monkeypatch.setattr(cl.Base64ScrubLogger, "_sync_scrub",
-                        lambda self, k, r: (_ for _ in ()).throw(ValueError("x")))
-    kwargs = {"standard_logging_object": {"response": {"a": "SECRET"}}}
-    out_kwargs, out_result = cl.Base64ScrubLogger().logging_hook(kwargs, "R", "x")
+    # 命中但路径对不上：必须发 warning（漏清洗不可静默），并标明走的是同步钩子
+    caplog.clear()
+    empty = make_kwargs("https://provider-a.example.com/v1", {"choices": []})
+    with caplog.at_level("INFO"):
+        cl.Base64ScrubLogger().logging_hook(empty, "R", "x")
+    assert any("matched but replaced nothing" in r.getMessage()
+               and "hook=sync" in r.getMessage() for r in caplog.records)
+
+
+def test_logging_hook_swallows_scrub_failure(patched_rules, caplog, monkeypatch):
+    """共用清洗实现抛异常：必须原样返回 + 留 WARNING，绝不把异常抛给 LiteLLM。"""
+    def boom(*a, **kw):
+        raise RuntimeError("synthetic scrub failure")
+
+    monkeypatch.setattr(cl, "_scrub_and_report", boom)
+    kwargs = make_kwargs("https://provider-a.example.com/v1", {"a": "SECRET"})
+    with caplog.at_level("INFO"):
+        out_kwargs, out_result = cl.Base64ScrubLogger().logging_hook(kwargs, "R", "x")
     assert out_kwargs is kwargs and out_result == "R"
+    assert kwargs["standard_logging_object"]["response"]["a"] == "SECRET"   # 原样入库
+    assert any("logging_hook failed" in r.getMessage() for r in caplog.records)
+
+
+def test_int_env_tolerates_bad_values(monkeypatch, caplog):
+    """
+    整数型环境变量写了非法值：告警并退回默认，绝不让 import 期抛异常。
+
+    这两个常量在模块加载时就要用，int() 抛出来的异常会让整个回调加载失败、
+    LiteLLM 连日志都写不了 —— compose 里一个拼写错误不该有这么大后果。
+    """
+    with caplog.at_level("WARNING"):
+        monkeypatch.setenv("SCRUB_TEST_INT", "64")
+        assert cl._int_env("SCRUB_TEST_INT", 8) == 64
+        monkeypatch.delenv("SCRUB_TEST_INT")
+        assert cl._int_env("SCRUB_TEST_INT", 8) == 8          # 未设置：默认值，不告警
+        monkeypatch.setenv("SCRUB_TEST_INT", "64x")
+        assert cl._int_env("SCRUB_TEST_INT", 8) == 8          # 非法：退回默认
+        monkeypatch.setenv("SCRUB_TEST_INT", "")
+        assert cl._int_env("SCRUB_TEST_INT", 8) == 8
+        monkeypatch.setenv("SCRUB_TEST_INT", "-1")
+        assert cl._int_env("SCRUB_TEST_INT", 8) == 8          # 负数无意义：退回默认
+        monkeypatch.setenv("SCRUB_TEST_INT", "0")
+        assert cl._int_env("SCRUB_TEST_INT", 8) == 0          # 0 是合法值，照用
+    msgs = [r.getMessage() for r in caplog.records]
+    # 三次非法取值各告警一次；合法取值（64 / 未设置 / 0）一次都不该告警
+    assert len(msgs) == 3
+    assert sum("is not an integer" in m for m in msgs) == 2
+    assert sum("must not be negative" in m for m in msgs) == 1
+
+
+@pytest.mark.parametrize("slo,expected_warning", [
+    # slo 整个缺失：上游此时直接写 "{}"，没有敏感数据，刻意静默
+    (None, None),
+    # slo 不是 dict（哪天上游换成 pydantic 模型就会走到这里）
+    ("not-a-dict", "standard_logging_object is str, not a dict"),
+    # slo 是 dict 但没有 response 键
+    ({}, None),
+    # response 不是 dict：明确告知"原样入库"
+    ({"response": ["a"]}, "standard_logging_object['response'] is list, not a dict"),
+    ({"response": "text"}, "standard_logging_object['response'] is str, not a dict"),
+])
+def test_slo_shape_mismatch_is_reported_precisely(slo, expected_warning, caplog):
+    """
+    形状不符必须"指名道姓"地告警。
+
+    只报"命中规则却零替换，请检查路径"会把排查引向错误方向：真正的原因是
+    上游形状变了、isinstance 判定整体失效，一个字段都没换。
+    """
+    token_lists = [("a.b", cl._tokenize("a.b"))]
+    with caplog.at_level("INFO"):
+        assert cl._scrub_slo_response(slo, token_lists) == (0, 0, 0)
+    msgs = [r.getMessage() for r in caplog.records]
+    if expected_warning is None:
+        assert not any("not a dict" in m for m in msgs)
+    else:
+        assert any(expected_warning in m for m in msgs)
+
+
+def test_scrub_slo_response_applies_every_path():
+    """一条规则下的多个路径必须全部执行，且统计是各路径之和。"""
+    slo = {"response": {
+        "choices": [{"message": {"content": "SECRET-1"}}],
+        "data": [{"b64_json": "SECRET-2"}, {"b64_json": "SECRET-3"}],
+        "keep": "untouched",
+    }}
+    token_lists = [
+        ("choices[*].message.content", cl._tokenize("choices[*].message.content")),
+        ("data[*].b64_json", cl._tokenize("data[*].b64_json")),
+    ]
+    replaced, capped, saved = cl._scrub_slo_response(slo, token_lists)
+    assert (replaced, capped) == (3, 0)
+    assert saved == sum(len(s) - len(PH) for s in ("SECRET-1", "SECRET-2", "SECRET-3"))
+    assert slo["response"]["choices"][0]["message"]["content"] == PH
+    assert [d["b64_json"] for d in slo["response"]["data"]] == [PH, PH]
+    assert slo["response"]["keep"] == "untouched"
 
 
 # --------------------------------------------------------------------

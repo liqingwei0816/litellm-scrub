@@ -3,7 +3,10 @@ services:
     image: ghcr.io/berriai/litellm:v1.83.14-stable
     container_name: litellm-scrub
     ports:
-      - "4000:4000"
+      # 只绑回环地址：这个代理带着 master key 和宿主机 Postgres 的凭据，
+      # 绑 0.0.0.0 等于把它开给整个局域网。确实要从别的机器访问时再改成
+      # "4000:4000"，并同时换掉下面这两个默认凭据。
+      - "127.0.0.1:4000:4000"
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       - ./custom_logger.py:/app/custom_logger.py:ro
@@ -25,5 +28,9 @@ services:
       # - MAX_STRING_LENGTH_PROMPT_IN_DB=10000000
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    command: ["--config", "/app/config.yaml","--detailed_debug"]
+    # 刻意不带 --detailed_debug：它等同 litellm._turn_on_debug()，会把每次调用的
+    # 原始响应整段打进容器日志（litellm_logging.py:1231 的 "RAW RESPONSE"），
+    # 而那正是本功能要从数据库里清掉的 base64；顺带它还会让"本模块 INFO 默认
+    # 不可见"这个前提失真。排查时临时加上，别在长期运行的部署里常开。
+    command: ["--config", "/app/config.yaml"]
     restart: unless-stopped
